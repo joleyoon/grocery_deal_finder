@@ -369,45 +369,7 @@ class TargetScraper(SiteScraper):
         return f"https://www.target.com/s?searchTerm={quote(search_term)}&category=5xt1a"
 
     def scrape_search_results(self, keyword: str) -> list[ProductPrice] | None:
-        body_text = normalize_whitespace(self.driver.find_element(By.TAG_NAME, "body").text)
-        results: list[ProductPrice] = []
-        seen_titles: set[str] = set()
-        cursor = 0
-        for anchor in self.driver.find_elements(By.XPATH, "//a[@href]"):
-            try:
-                title = normalize_whitespace(anchor.text)
-                href = normalize_whitespace(anchor.get_attribute("href") or "")
-            except StaleElementReferenceException:
-                continue
-            if not title or title in seen_titles:
-                continue
-            if "/home/products/pdp/" not in href:
-                continue
-            if not title_matches_keyword(title, keyword):
-                continue
-            seen_titles.add(title)
-            segment = self.nearest_priced_parent_text(anchor)
-            if not segment:
-                index = body_text.lower().find(title.lower(), cursor)
-                if index >= 0:
-                    cursor = index + len(title)
-                segment = body_text[index : index + 200] if index >= 0 else title
-            price_text = extract_price_phrase(segment)
-            results.append(
-                ProductPrice(
-                    store=self.store_name,
-                    keyword=keyword,
-                    title=title,
-                    price_text=price_text,
-                    price=parse_price_value(price_text),
-                    unit_price_text=extract_unit_price(segment),
-                    url=href,
-                    note=None if price_text else "price not found; the site layout may have changed",
-                )
-            )
-            if len(results) >= self.settings.limit:
-                break
-        return results
+        return self.parse_products_from_lines(keyword, context_before=1, context_after=3)
 
     def is_relevant_product(self, title: str, page_text: str, keyword: str) -> bool:
         if not title_matches_keyword(title, keyword):
@@ -562,7 +524,45 @@ class TraderJoesScraper(SiteScraper):
         raise RuntimeError("search input not found on Trader Joe's products page")
 
     def scrape_search_results(self, keyword: str) -> list[ProductPrice] | None:
-        return self.parse_products_from_lines(keyword, context_before=1, context_after=3)
+        body_text = normalize_whitespace(self.driver.find_element(By.TAG_NAME, "body").text)
+        results: list[ProductPrice] = []
+        seen_titles: set[str] = set()
+        cursor = 0
+        for anchor in self.driver.find_elements(By.XPATH, "//a[@href]"):
+            try:
+                title = normalize_whitespace(anchor.text)
+                href = normalize_whitespace(anchor.get_attribute("href") or "")
+            except StaleElementReferenceException:
+                continue
+            if not title or title in seen_titles:
+                continue
+            if "/home/products/pdp/" not in href:
+                continue
+            if not title_matches_keyword(title, keyword):
+                continue
+            seen_titles.add(title)
+            segment = self.nearest_priced_parent_text(anchor)
+            if not segment:
+                index = body_text.lower().find(title.lower(), cursor)
+                if index >= 0:
+                    cursor = index + len(title)
+                segment = body_text[index : index + 200] if index >= 0 else title
+            price_text = extract_price_phrase(segment)
+            results.append(
+                ProductPrice(
+                    store=self.store_name,
+                    keyword=keyword,
+                    title=title,
+                    price_text=price_text,
+                    price=parse_price_value(price_text),
+                    unit_price_text=extract_unit_price(segment),
+                    url=href,
+                    note=None if price_text else "price not found; the site layout may have changed",
+                )
+            )
+            if len(results) >= self.settings.limit:
+                break
+        return results
 
 
 def build_scrapers(
