@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from time import sleep
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote
 
 from selenium.common.exceptions import (
     ElementClickInterceptedException,
@@ -565,67 +565,12 @@ class TraderJoesScraper(SiteScraper):
         return self.parse_products_from_lines(keyword, context_before=1, context_after=3)
 
 
-class RalphsScraper(SiteScraper):
-    store_name = "ralphs"
-    detail_url_markers = ("/p/", "/pd/")
-
-    def build_search_url(self, keyword: str) -> str:
-        return (
-            "https://www.ralphs.com/search?"
-            f"query={quote_plus(keyword)}&searchType=default_search"
-        )
-
-    def apply_location(self) -> None:
-        if not self.location_query:
-            return
-
-        self.click_first(
-            (
-                "//button[contains(., 'Pickup at')]",
-                "//button[contains(., 'Delivery')]",
-                "//button[contains(., 'Current Store')]",
-                "//button[contains(., 'Change Store')]",
-            )
-        )
-        typed = self.type_into_first(
-            (
-                "//input[@type='search']",
-                "//input[contains(translate(@placeholder, 'ZIPSTORE', 'zipstore'), 'zip')]",
-                "//input[contains(translate(@placeholder, 'ZIPSTORE', 'zipstore'), 'store')]",
-            ),
-            self.location_query,
-        )
-        if not typed:
-            return
-
-        for xpath in (
-            "//input[@type='search']",
-            "//input[contains(@aria-label, 'store')]",
-        ):
-            elements = self.driver.find_elements(By.XPATH, xpath)
-            for element in elements:
-                if self._is_visible(element):
-                    element.send_keys(Keys.ENTER)
-                    sleep(self.settings.pause_seconds * 2)
-                    break
-
-        self.click_first(
-            (
-                "//button[contains(., 'Set as store')]",
-                "//button[contains(., 'Select this store')]",
-                "//button[contains(., 'Make my store')]",
-            )
-        )
-        sleep(self.settings.pause_seconds * 2)
-
-
 def build_scrapers(
     driver: WebDriver,
     settings: ScraperSettings,
     *,
     zip_code: str | None,
     wholefoods_store: str | None,
-    ralphs_store: str | None,
 ) -> dict[str, SiteScraper]:
     return {
         "target": TargetScraper(driver, settings),
@@ -635,9 +580,4 @@ def build_scrapers(
             location_query=wholefoods_store or zip_code,
         ),
         "traderjoes": TraderJoesScraper(driver, settings),
-        "ralphs": RalphsScraper(
-            driver,
-            settings,
-            location_query=ralphs_store or zip_code,
-        ),
     }

@@ -11,14 +11,14 @@ from .stores import ScraperSettings, build_scrapers
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Scrape grocery product prices across Target, Whole Foods, Trader Joe's, and Ralphs.",
+        description="Scrape grocery product prices across Target, Whole Foods, and Trader Joe's.",
     )
     parser.add_argument("keyword", help="Keyword to search for, for example: apple")
     parser.add_argument(
         "--stores",
         nargs="+",
-        choices=("target", "wholefoods", "traderjoes", "ralphs"),
-        default=("target", "wholefoods", "traderjoes", "ralphs"),
+        choices=("target", "wholefoods", "traderjoes"),
+        default=("target", "wholefoods", "traderjoes"),
         help="Subset of stores to query.",
     )
     parser.add_argument(
@@ -42,15 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--zip",
         dest="zip_code",
-        help="Zip code used as a best-effort store selector for Whole Foods and Ralphs.",
+        help="Zip code used as a best-effort store selector for Whole Foods.",
     )
     parser.add_argument(
         "--wholefoods-store",
         help="Whole Foods store query, for example: 'Los Angeles, CA' or a zip code.",
-    )
-    parser.add_argument(
-        "--ralphs-store",
-        help="Ralphs store query, for example: 'Citrus Plaza' or a zip code.",
     )
     parser.add_argument(
         "--chrome-binary",
@@ -117,7 +113,6 @@ def main(argv: list[str] | None = None) -> int:
             settings,
             zip_code=args.zip_code,
             wholefoods_store=args.wholefoods_store,
-            ralphs_store=args.ralphs_store,
         )
 
         all_results: list[ProductPrice] = []
