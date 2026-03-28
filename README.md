@@ -138,6 +138,12 @@ Search listings:
 curl "http://127.0.0.1:5000/api/products?query=apple&in_stock=true"
 ```
 
+Refresh stale cached results automatically during a product search:
+
+```bash
+curl "http://127.0.0.1:5000/api/products?query=apple&refresh_if_stale=true"
+```
+
 Compare offers:
 
 ```bash
@@ -163,6 +169,7 @@ curl -X POST http://127.0.0.1:5000/api/transactions/purchases \
 ## Notes
 
 - The backend reuses the Selenium collector already in this repo rather than duplicating scraping logic.
+- `GET /api/products?refresh_if_stale=true` will trigger Selenium only when matching store data is missing or older than 24 hours.
 - Whole Foods is location-sensitive and may need `zip_code` or `wholefoods_store` when scraping.
 - Target treats the bare query `apple` as the Apple brand, so the scraper disambiguates that case to `apple fruit`.
 - Trader Joe's broad search results can match many apple-adjacent products, so narrower produce queries work better for store-only produce comparisons.
