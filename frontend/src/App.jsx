@@ -137,21 +137,26 @@ export default function App() {
     params.set("limit", "30");
 
     try {
-      const [productsResponse, comparisonResponse, transactionsResponse] = await Promise.all([
-        fetch(apiUrl(`/api/products?${params.toString()}`)),
-        fetch(apiUrl(`/api/compare?${params.toString()}`)),
-        fetch(apiUrl("/api/transactions?limit=6"))
-      ]);
+      const productParams = new URLSearchParams(params);
+      if (nextFilters.query) {
+        productParams.set("refresh_if_stale", "true");
+      }
 
-      const [productsPayload, comparisonPayload, transactionsPayload] = await Promise.all([
-        productsResponse.json(),
-        comparisonResponse.json(),
-        transactionsResponse.json()
-      ]);
+      const productsResponse = await fetch(apiUrl(`/api/products?${productParams.toString()}`));
+      const productsPayload = await productsResponse.json();
 
       if (!productsResponse.ok) {
         throw new Error(productsPayload.error || "Failed to load products");
       }
+
+      const [comparisonResponse, transactionsResponse] = await Promise.all([
+        fetch(apiUrl(`/api/compare?${params.toString()}`)),
+        fetch(apiUrl("/api/transactions?limit=6"))
+      ]);
+      const [comparisonPayload, transactionsPayload] = await Promise.all([
+        comparisonResponse.json(),
+        transactionsResponse.json()
+      ]);
       if (!comparisonResponse.ok) {
         throw new Error(comparisonPayload.error || "Failed to load comparisons");
       }
@@ -160,7 +165,13 @@ export default function App() {
         setResults(productsPayload.items ?? []);
         setComparison(comparisonPayload);
         setTransactions(transactionsPayload.items ?? []);
+        if (productsPayload.refreshed_stores?.length) {
+          setMessage(`Refreshed stale data for ${productsPayload.refreshed_stores.join(", ")}.`);
+        }
       });
+      if (productsPayload.refresh_error) {
+        setError(`Showing cached results. Auto-refresh failed: ${productsPayload.refresh_error}`);
+      }
     } catch (requestError) {
       setError(requestError.message);
     } finally {

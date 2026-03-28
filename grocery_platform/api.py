@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
@@ -21,7 +21,7 @@ from .services.catalog import (
     seed_stores,
     upsert_scraped_result,
 )
-from .services.collector import collect_prices
+from .services.collector import collect_prices, refresh_query_if_stale
 
 
 api = Blueprint("api", __name__, url_prefix="/api")
@@ -29,6 +29,10 @@ api = Blueprint("api", __name__, url_prefix="/api")
 
 def bad_request(message: str, status_code: int = 400):
     return jsonify({"error": message}), status_code
+
+
+def truthy_arg(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @api.get("/health")
@@ -50,8 +54,23 @@ def products():
     session = get_session()
     query = request.args.get("query")
     store_slug = request.args.get("store")
-    in_stock_only = request.args.get("in_stock", "false").lower() == "true"
+    in_stock_only = truthy_arg(request.args.get("in_stock"))
+    refresh_if_stale = truthy_arg(request.args.get("refresh_if_stale"))
     limit = min(int(request.args.get("limit", 50)), 100)
+    stale_after_hours = int(current_app.config.get("STALE_QUERY_TTL_HOURS", 24))
+    refreshed_stores: list[str] = []
+    refresh_error: str | None = None
+    if refresh_if_stale and query:
+        try:
+            refreshed_stores = refresh_query_if_stale(
+                session,
+                query=query,
+                store_slug=store_slug,
+                limit=limit,
+                stale_after_hours=stale_after_hours,
+            )
+        except Exception as exc:  # noqa: BLE001
+            refresh_error = str(exc)
     rows = search_listings(
         session,
         query=query,
@@ -63,6 +82,10 @@ def products():
         {
             "query": query,
             "count": len(rows),
+            "refreshed": bool(refreshed_stores),
+            "refreshed_stores": refreshed_stores,
+            "refresh_error": refresh_error,
+            "stale_after_hours": stale_after_hours,
             "items": [serialize_listing(row) for row in rows],
         }
     )
@@ -114,7 +137,7 @@ def compare():
         session,
         query=query,
         store_slug=request.args.get("store"),
-        in_stock_only=request.args.get("in_stock", "false").lower() == "true",
+        in_stock_only=truthy_arg(request.args.get("in_stock")),
         limit=min(int(request.args.get("limit", 50)), 100),
     )
     priced_rows = [row for row in rows if row.current_price is not None]
@@ -140,7 +163,7 @@ def inventory():
         session,
         query=request.args.get("query"),
         store_slug=request.args.get("store"),
-        in_stock_only=request.args.get("in_stock", "false").lower() == "true",
+        in_stock_only=truthy_arg(request.args.get("in_stock")),
         limit=min(int(request.args.get("limit", 50)), 100),
     )
     return jsonify(

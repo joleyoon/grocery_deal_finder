@@ -13,5 +13,6 @@ class Config:
         "DATABASE_URL",
         f"sqlite:///{BASE_DIR / 'grocery_platform.db'}",
     )
+    STALE_QUERY_TTL_HOURS = int(os.getenv("STALE_QUERY_TTL_HOURS", "24"))
     JSON_SORT_KEYS = False
     FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
