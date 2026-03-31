@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import click
-from flask import Flask, jsonify, send_from_directory
+from flask import Flask, abort, jsonify, send_from_directory
 
 try:
     from flask_cors import CORS
@@ -42,6 +42,7 @@ def create_app(config_overrides: dict | None = None) -> Flask:
             }
         )
 
+    register_missing_api_routes(app)
     return app
 
 
@@ -74,7 +75,16 @@ def register_frontend_routes(app: Flask) -> None:
 
     @app.get("/<path:filename>")
     def frontend_fallback(filename: str):
+        if filename.startswith("api/"):
+            abort(404)
         file_path = frontend_dist / filename
         if file_path.exists():
             return send_from_directory(frontend_dist, filename)
         return send_from_directory(frontend_dist, "index.html")
+
+
+def register_missing_api_routes(app: Flask) -> None:
+    @app.route("/api", defaults={"path": ""}, methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+    @app.route("/api/<path:path>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+    def missing_api_route(path: str):
+        abort(404)

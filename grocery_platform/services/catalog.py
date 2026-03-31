@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from decimal import Decimal
 
+from flask import Flask
 from sqlalchemy import Select, or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from grocery_scraper.models import ProductPrice
 
-from ..models import InventoryAdjustment, Listing, PriceHistory, PurchaseTransaction, Store, utcnow
+from ..models import Listing, PriceHistory, Store, utcnow
 
 
 STORE_NAMES = {
@@ -41,12 +43,25 @@ def listing_query() -> Select[tuple[Listing]]:
     return select(Listing).options(joinedload(Listing.store))
 
 
+@dataclass
+class ListingSearchResult:
+    items: list[Listing]
+    refreshed_stores: list[str] = field(default_factory=list)
+    refresh_error: str | None = None
+    refresh_mode: str = "none"
+    refresh_status: dict[str, object] | None = None
+    stale_after_hours: int = 24
+
+    @property
+    def refreshed(self) -> bool:
+        return self.refresh_mode != "none"
+
+
 def search_listings(
     session: Session,
     *,
     query: str | None,
     store_slug: str | None,
-    in_stock_only: bool,
     limit: int,
 ) -> list[Listing]:
     stmt = listing_query().order_by(Listing.updated_at.desc(), Listing.title.asc())
@@ -61,9 +76,146 @@ def search_listings(
                 Listing.normalized_title.ilike(pattern.lower()),
             )
         )
-    if in_stock_only:
-        stmt = stmt.where(Listing.inventory_count > 0)
     return list(session.scalars(stmt.limit(limit)))
+
+
+def search_listings_cached(
+    session: Session,
+    *,
+    query: str | None,
+    store_slug: str | None,
+    limit: int,
+    stale_after_hours: int,
+    refresh_if_stale: bool = False,
+    force_refresh: bool = False,
+    app: Flask | None = None,
+    background_refresh: bool = True,
+    zip_code: str | None = None,
+    wholefoods_store: str | None = None,
+    chrome_binary: str | None = None,
+    show_browser: bool = False,
+    timeout: int = 20,
+    pause_seconds: float = 1.0,
+) -> ListingSearchResult:
+    rows = search_listings(
+        session,
+        query=query,
+        store_slug=store_slug,
+        limit=limit,
+    )
+    cleaned_query = (query or "").strip()
+    if not cleaned_query:
+        return ListingSearchResult(items=rows, stale_after_hours=stale_after_hours)
+
+    from .collector import (
+        get_refresh_status,
+        refresh_job_key,
+        refresh_query,
+        schedule_query_refresh,
+        stale_store_slugs,
+        target_store_slugs,
+    )
+
+    try:
+        if not rows:
+            refreshed_stores = refresh_query(
+                session,
+                query=cleaned_query,
+                store_slug=store_slug,
+                limit=limit,
+                zip_code=zip_code,
+                wholefoods_store=wholefoods_store,
+                chrome_binary=chrome_binary,
+                show_browser=show_browser,
+                timeout=timeout,
+                pause_seconds=pause_seconds,
+            )
+            return ListingSearchResult(
+                items=search_listings(
+                    session,
+                    query=query,
+                    store_slug=store_slug,
+                    limit=limit,
+                ),
+                refreshed_stores=refreshed_stores,
+                refresh_mode="blocking" if refreshed_stores else "none",
+                stale_after_hours=stale_after_hours,
+            )
+
+        stores_to_refresh: list[str] = []
+        if force_refresh:
+            stores_to_refresh = target_store_slugs(store_slug)
+        elif refresh_if_stale:
+            stores_to_refresh = stale_store_slugs(
+                session,
+                query=cleaned_query,
+                store_slug=store_slug,
+                stale_after_hours=stale_after_hours,
+                search_limit=limit,
+            )
+
+        if not stores_to_refresh:
+            return ListingSearchResult(items=rows, stale_after_hours=stale_after_hours)
+
+        if app is not None and background_refresh:
+            refreshed_stores = schedule_query_refresh(
+                app,
+                query=cleaned_query,
+                store_slug=store_slug,
+                limit=limit,
+                stores=stores_to_refresh,
+                zip_code=zip_code,
+                wholefoods_store=wholefoods_store,
+                chrome_binary=chrome_binary,
+                show_browser=show_browser,
+                timeout=timeout,
+                pause_seconds=pause_seconds,
+            )
+            refresh_status = None
+            if refreshed_stores:
+                refresh_status = get_refresh_status(
+                    app,
+                    refresh_job_key(cleaned_query, refreshed_stores, limit),
+                )
+            return ListingSearchResult(
+                items=rows,
+                refreshed_stores=refreshed_stores,
+                refresh_mode="background" if refreshed_stores else "none",
+                refresh_status=refresh_status,
+                stale_after_hours=stale_after_hours,
+            )
+
+        refreshed_stores = refresh_query(
+            session,
+            query=cleaned_query,
+            store_slug=store_slug,
+            limit=limit,
+            stores=stores_to_refresh,
+            zip_code=zip_code,
+            wholefoods_store=wholefoods_store,
+            chrome_binary=chrome_binary,
+            show_browser=show_browser,
+            timeout=timeout,
+            pause_seconds=pause_seconds,
+        )
+        return ListingSearchResult(
+            items=search_listings(
+                session,
+                query=query,
+                store_slug=store_slug,
+                limit=limit,
+            ),
+            refreshed_stores=refreshed_stores,
+            refresh_mode="blocking" if refreshed_stores else "none",
+            stale_after_hours=stale_after_hours,
+        )
+    except Exception as exc:  # noqa: BLE001
+        session.rollback()
+        return ListingSearchResult(
+            items=rows,
+            refresh_error=str(exc),
+            stale_after_hours=stale_after_hours,
+        )
 
 
 def get_listing_or_404(session: Session, listing_id: int) -> Listing | None:
@@ -107,7 +259,6 @@ def upsert_scraped_result(session: Session, result: ProductPrice) -> Listing:
             keyword=result.keyword,
             title=result.title or result.keyword,
             normalized_title=normalized_title,
-            inventory_status="unknown",
         )
         session.add(listing)
         session.flush()
@@ -122,8 +273,6 @@ def upsert_scraped_result(session: Session, result: ProductPrice) -> Listing:
     listing.note = result.note
     listing.last_seen_at = utcnow()
     listing.updated_at = utcnow()
-    if listing.current_price_text and listing.inventory_status == "unknown":
-        listing.inventory_status = "tracked"
 
     record_price_history(
         session,
@@ -133,63 +282,3 @@ def upsert_scraped_result(session: Session, result: ProductPrice) -> Listing:
         unit_price_text=listing.unit_price_text,
     )
     return listing
-
-
-def apply_inventory_adjustment(
-    session: Session,
-    *,
-    listing: Listing,
-    delta: int,
-    reason: str,
-    actor: str | None,
-) -> InventoryAdjustment:
-    new_quantity = listing.inventory_count + delta
-    if new_quantity < 0:
-        raise ValueError("inventory adjustment would make quantity negative")
-    listing.inventory_count = new_quantity
-    listing.inventory_status = "in_stock" if new_quantity > 0 else "out_of_stock"
-    listing.updated_at = utcnow()
-
-    adjustment = InventoryAdjustment(
-        listing=listing,
-        delta=delta,
-        reason=reason,
-        actor=actor,
-        resulting_quantity=new_quantity,
-    )
-    session.add(adjustment)
-    return adjustment
-
-
-def create_purchase_transaction(
-    session: Session,
-    *,
-    listing: Listing,
-    quantity: int,
-    purchaser_name: str | None,
-    note: str | None,
-) -> PurchaseTransaction:
-    if quantity <= 0:
-        raise ValueError("quantity must be greater than zero")
-    if listing.inventory_count < quantity:
-        raise ValueError("inventory is too low for this purchase")
-
-    unit_price = listing.current_price
-    total_price = unit_price * quantity if unit_price is not None else None
-    transaction = PurchaseTransaction(
-        listing=listing,
-        quantity=quantity,
-        unit_price=unit_price,
-        total_price=total_price,
-        purchaser_name=purchaser_name,
-        note=note,
-    )
-    session.add(transaction)
-    apply_inventory_adjustment(
-        session,
-        listing=listing,
-        delta=-quantity,
-        reason="purchase",
-        actor=purchaser_name,
-    )
-    return transaction

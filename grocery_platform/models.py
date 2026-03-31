@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, ForeignKey, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -43,8 +43,6 @@ class Listing(Base):
     current_price_text: Mapped[str | None] = mapped_column(String(80), nullable=True)
     unit_price_text: Mapped[str | None] = mapped_column(String(80), nullable=True)
     note: Mapped[str | None] = mapped_column(Text(), nullable=True)
-    inventory_count: Mapped[int] = mapped_column(Integer, default=0)
-    inventory_status: Mapped[str] = mapped_column(String(32), default="unknown")
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -59,16 +57,6 @@ class Listing(Base):
         cascade="all, delete-orphan",
         order_by="desc(PriceHistory.observed_at)",
     )
-    inventory_adjustments: Mapped[list["InventoryAdjustment"]] = relationship(
-        back_populates="listing",
-        cascade="all, delete-orphan",
-        order_by="desc(InventoryAdjustment.created_at)",
-    )
-    transactions: Mapped[list["PurchaseTransaction"]] = relationship(
-        back_populates="listing",
-        cascade="all, delete-orphan",
-        order_by="desc(PurchaseTransaction.created_at)",
-    )
 
 
 class PriceHistory(Base):
@@ -82,32 +70,3 @@ class PriceHistory(Base):
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     listing: Mapped["Listing"] = relationship(back_populates="price_history")
-
-
-class InventoryAdjustment(Base):
-    __tablename__ = "inventory_adjustments"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    listing_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), index=True)
-    delta: Mapped[int] = mapped_column(Integer)
-    reason: Mapped[str] = mapped_column(String(120))
-    actor: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    resulting_quantity: Mapped[int] = mapped_column(Integer)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-    listing: Mapped["Listing"] = relationship(back_populates="inventory_adjustments")
-
-
-class PurchaseTransaction(Base):
-    __tablename__ = "purchase_transactions"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    listing_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), index=True)
-    quantity: Mapped[int] = mapped_column(Integer)
-    unit_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
-    total_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
-    purchaser_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    note: Mapped[str | None] = mapped_column(Text(), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-    listing: Mapped["Listing"] = relationship(back_populates="transactions")
