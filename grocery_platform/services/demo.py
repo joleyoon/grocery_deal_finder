@@ -17,8 +17,6 @@ DEMO_ROWS = [
         "price": Decimal("1.49"),
         "price_text": "$1.49",
         "unit_price_text": None,
-        "inventory_count": 26,
-        "inventory_status": "in_stock",
         "url": "https://www.target.com/p/honeycrisp-apple-each/-/A-31167786",
     },
     {
@@ -28,8 +26,6 @@ DEMO_ROWS = [
         "price": Decimal("3.99"),
         "price_text": "$3.99/lb",
         "unit_price_text": "$3.99/lb",
-        "inventory_count": 14,
-        "inventory_status": "in_stock",
         "url": "https://www.wholefoodsmarket.com/grocery/product/fresh-produce-organic-honeycrisp-apple-b001gip2a8",
     },
     {
@@ -39,8 +35,6 @@ DEMO_ROWS = [
         "price": Decimal("2.99"),
         "price_text": "$2.99/12.7 Oz",
         "unit_price_text": "$2.99/12.7 Oz",
-        "inventory_count": 18,
-        "inventory_status": "in_stock",
         "url": "https://www.traderjoes.com/home/products/pdp/sugar-bee-apple-078597",
     },
 ]
@@ -72,8 +66,6 @@ def seed_demo_data(session: Session) -> None:
         listing.current_price = row["price"]
         listing.current_price_text = row["price_text"]
         listing.unit_price_text = row["unit_price_text"]
-        listing.inventory_count = row["inventory_count"]
-        listing.inventory_status = row["inventory_status"]
 
         if not listing.price_history:
             session.add(

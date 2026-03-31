@@ -1,25 +1,10 @@
-import { startTransition, useEffect, useMemo, useState } from "react";
+import { startTransition, useEffect, useMemo, useRef, useState } from "react";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "";
 
 const initialFilters = {
   query: "apple",
-  store: "",
-  inStock: false
-};
-
-const initialPurchase = {
-  listingId: "",
-  quantity: 1,
-  purchaserName: "",
-  note: ""
-};
-
-const initialInventory = {
-  listingId: "",
-  delta: 1,
-  reason: "restock",
-  actor: ""
+  store: ""
 };
 
 function currency(value) {
@@ -41,17 +26,6 @@ function compactDate(value) {
 
 function apiUrl(path) {
   return `${API_BASE}${path}`;
-}
-
-function StatusPill({ status, count }) {
-  const tone =
-    status === "in_stock" ? "pill-in" : status === "out_of_stock" ? "pill-out" : "pill-neutral";
-
-  return (
-    <span className={`status-pill ${tone}`}>
-      {status.replaceAll("_", " ")} · {count}
-    </span>
-  );
 }
 
 function TrendBars({ history }) {
@@ -85,28 +59,25 @@ export default function App() {
   const [filters, setFilters] = useState(initialFilters);
   const [results, setResults] = useState([]);
   const [comparison, setComparison] = useState({ offers: [], summary: {} });
-  const [transactions, setTransactions] = useState([]);
   const [selected, setSelected] = useState(null);
   const [history, setHistory] = useState([]);
-  const [purchaseForm, setPurchaseForm] = useState(initialPurchase);
-  const [inventoryForm, setInventoryForm] = useState(initialInventory);
   const [loading, setLoading] = useState(true);
-  const [syncing, setSyncing] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [pendingRefresh, setPendingRefresh] = useState(null);
+  const selectedRef = useRef(null);
+
+  useEffect(() => {
+    selectedRef.current = selected;
+  }, [selected]);
 
   useEffect(() => {
     async function bootstrap() {
       try {
-        const [storesResponse, transactionsResponse] = await Promise.all([
-          fetch(apiUrl("/api/stores")),
-          fetch(apiUrl("/api/transactions?limit=6"))
-        ]);
+        const storesResponse = await fetch(apiUrl("/api/stores"));
         const storesPayload = await storesResponse.json();
-        const transactionsPayload = await transactionsResponse.json();
         startTransition(() => {
           setStores(storesPayload);
-          setTransactions(transactionsPayload.items ?? []);
         });
         await runSearch(initialFilters);
       } catch (requestError) {
@@ -119,10 +90,79 @@ export default function App() {
     bootstrap();
   }, []);
 
-  async function runSearch(nextFilters = filters) {
+  useEffect(() => {
+    if (!pendingRefresh?.key) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    let timeoutId;
+
+    async function pollRefresh() {
+      try {
+        const response = await fetch(
+          apiUrl(`/api/refresh-status?key=${encodeURIComponent(pendingRefresh.key)}`)
+        );
+        const payload = await response.json();
+
+        if (cancelled) {
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(payload.error || "Failed to check refresh status");
+        }
+
+        if (payload.state === "completed") {
+          const refreshedStoreLabel = (payload.stores ?? []).join(", ");
+          setPendingRefresh(null);
+          await runSearch(pendingRefresh.filters, {
+            preserveMessage: true,
+            successMessage: refreshedStoreLabel
+              ? `Background refresh complete for ${refreshedStoreLabel}.`
+              : "Background refresh complete.",
+            refreshSelectedDetail: Boolean(selectedRef.current)
+          });
+          return;
+        }
+
+        if (payload.state === "failed") {
+          setPendingRefresh(null);
+          setError(payload.error || "Background refresh failed.");
+          return;
+        }
+
+        timeoutId = window.setTimeout(pollRefresh, 1500);
+      } catch (requestError) {
+        if (cancelled) {
+          return;
+        }
+        setPendingRefresh(null);
+        setError(requestError.message);
+      }
+    }
+
+    timeoutId = window.setTimeout(pollRefresh, 1500);
+    return () => {
+      cancelled = true;
+      if (timeoutId) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [pendingRefresh]);
+
+  async function runSearch(nextFilters = filters, options = {}) {
+    const {
+      preserveMessage = false,
+      successMessage = "",
+      refreshSelectedDetail = false
+    } = options;
+
+    setPendingRefresh(null);
     setLoading(true);
     setError("");
-    setMessage("");
+    if (!preserveMessage) {
+      setMessage("");
+    }
 
     const params = new URLSearchParams();
     if (nextFilters.query) {
@@ -130,9 +170,6 @@ export default function App() {
     }
     if (nextFilters.store) {
       params.set("store", nextFilters.store);
-    }
-    if (nextFilters.inStock) {
-      params.set("in_stock", "true");
     }
     params.set("limit", "30");
 
@@ -149,14 +186,8 @@ export default function App() {
         throw new Error(productsPayload.error || "Failed to load products");
       }
 
-      const [comparisonResponse, transactionsResponse] = await Promise.all([
-        fetch(apiUrl(`/api/compare?${params.toString()}`)),
-        fetch(apiUrl("/api/transactions?limit=6"))
-      ]);
-      const [comparisonPayload, transactionsPayload] = await Promise.all([
-        comparisonResponse.json(),
-        transactionsResponse.json()
-      ]);
+      const comparisonResponse = await fetch(apiUrl(`/api/compare?${params.toString()}`));
+      const comparisonPayload = await comparisonResponse.json();
       if (!comparisonResponse.ok) {
         throw new Error(comparisonPayload.error || "Failed to load comparisons");
       }
@@ -164,13 +195,29 @@ export default function App() {
       startTransition(() => {
         setResults(productsPayload.items ?? []);
         setComparison(comparisonPayload);
-        setTransactions(transactionsPayload.items ?? []);
         if (productsPayload.refreshed_stores?.length) {
-          setMessage(`Refreshed stale data for ${productsPayload.refreshed_stores.join(", ")}.`);
+          if (productsPayload.refresh_mode === "background") {
+            setMessage(
+              `Refreshing ${productsPayload.refreshed_stores.join(", ")} in the background. Showing cached results for now.`
+            );
+          } else {
+            setMessage(`Refreshed data for ${productsPayload.refreshed_stores.join(", ")}.`);
+          }
+        } else if (successMessage) {
+          setMessage(successMessage);
         }
       });
+      if (productsPayload.refresh_mode === "background" && productsPayload.refresh_status?.key) {
+        setPendingRefresh({
+          key: productsPayload.refresh_status.key,
+          filters: nextFilters
+        });
+      }
       if (productsPayload.refresh_error) {
         setError(`Showing cached results. Auto-refresh failed: ${productsPayload.refresh_error}`);
+      }
+      if (refreshSelectedDetail && selectedRef.current) {
+        await openDetail(selectedRef.current);
       }
     } catch (requestError) {
       setError(requestError.message);
@@ -181,16 +228,6 @@ export default function App() {
 
   async function openDetail(listing) {
     setSelected(listing);
-    setPurchaseForm((current) => ({
-      ...current,
-      listingId: String(listing.id),
-      quantity: 1
-    }));
-    setInventoryForm((current) => ({
-      ...current,
-      listingId: String(listing.id),
-      delta: listing.inventory_count === 0 ? 6 : 1
-    }));
 
     try {
       const response = await fetch(apiUrl(`/api/products/${listing.id}`));
@@ -202,95 +239,6 @@ export default function App() {
         setSelected(payload.item);
         setHistory(payload.history ?? []);
       });
-    } catch (requestError) {
-      setError(requestError.message);
-    }
-  }
-
-  async function syncLivePrices() {
-    setSyncing(true);
-    setError("");
-    setMessage("");
-
-    try {
-      const response = await fetch(apiUrl("/api/scrapes"), {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          keyword: filters.query || "apple",
-          stores: filters.store ? [filters.store] : undefined,
-          limit: 8
-        })
-      });
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload.error || "Failed to sync live prices");
-      }
-      setMessage(`Synced ${payload.count} live listings for "${payload.keyword}".`);
-      await runSearch(filters);
-    } catch (requestError) {
-      setError(requestError.message);
-    } finally {
-      setSyncing(false);
-    }
-  }
-
-  async function submitPurchase(event) {
-    event.preventDefault();
-    setError("");
-    setMessage("");
-
-    try {
-      const response = await fetch(apiUrl("/api/transactions/purchases"), {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          listing_id: Number(purchaseForm.listingId),
-          quantity: Number(purchaseForm.quantity),
-          purchaser_name: purchaseForm.purchaserName,
-          note: purchaseForm.note
-        })
-      });
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload.error || "Failed to create purchase");
-      }
-      setMessage("Purchase transaction recorded.");
-      setPurchaseForm((current) => ({ ...current, quantity: 1, note: "" }));
-      await Promise.all([runSearch(filters), openDetail(payload.item)]);
-    } catch (requestError) {
-      setError(requestError.message);
-    }
-  }
-
-  async function submitInventoryAdjustment(event) {
-    event.preventDefault();
-    setError("");
-    setMessage("");
-
-    try {
-      const response = await fetch(apiUrl("/api/inventory/adjustments"), {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          listing_id: Number(inventoryForm.listingId),
-          delta: Number(inventoryForm.delta),
-          reason: inventoryForm.reason,
-          actor: inventoryForm.actor
-        })
-      });
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload.error || "Failed to adjust inventory");
-      }
-      setMessage("Inventory updated.");
-      await Promise.all([runSearch(filters), openDetail(payload.item)]);
     } catch (requestError) {
       setError(requestError.message);
     }
@@ -312,11 +260,11 @@ export default function App() {
       <header className="hero-panel reveal">
         <div className="hero-copy">
           <p className="eyebrow">Grocery Price Comparison Platform</p>
-          <h1>Search prices, track shelf counts, and record purchases in one flow.</h1>
+          <h1>Search prices, compare offers, and inspect recent price movement.</h1>
           <p className="hero-text">
-            Flask powers the API, PostgreSQL-ready models store the catalog and history, Selenium
-            collects live retailer data, and the React dashboard ties inventory and transactions
-            together.
+            Flask powers the API, SQLAlchemy stores the catalog and price history, Selenium
+            refreshes live retailer data when results go stale, and the React dashboard keeps the
+            freshest available offers in view.
           </p>
         </div>
 
@@ -330,8 +278,8 @@ export default function App() {
             <strong>{results.length}</strong>
           </article>
           <article className="metric-card">
-            <span>Recent transactions</span>
-            <strong>{transactions.length}</strong>
+            <span>Tracked stores</span>
+            <strong>{stores.length}</strong>
           </article>
         </div>
       </header>
@@ -341,11 +289,8 @@ export default function App() {
           <div className="panel-header">
             <div>
               <p className="eyebrow">Search</p>
-              <h2>Product search and live sync</h2>
+              <h2>Product search</h2>
             </div>
-            <button className="accent-button" type="button" onClick={syncLivePrices} disabled={syncing}>
-              {syncing ? "Syncing..." : "Sync Live Prices"}
-            </button>
           </div>
 
           <form
@@ -383,17 +328,6 @@ export default function App() {
               </select>
             </label>
 
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={filters.inStock}
-                onChange={(event) =>
-                  setFilters((current) => ({ ...current, inStock: event.target.checked }))
-                }
-              />
-              In-stock only
-            </label>
-
             <button className="primary-button" type="submit">
               Search
             </button>
@@ -427,7 +361,7 @@ export default function App() {
           <div className="panel-header">
             <div>
               <p className="eyebrow">Catalog</p>
-              <h2>Listings and inventory</h2>
+              <h2>Listings</h2>
             </div>
             <span className="panel-caption">{loading ? "Loading..." : `${results.length} items`}</span>
           </div>
@@ -443,9 +377,8 @@ export default function App() {
 
                 <div className="listing-side">
                   <strong>{currency(listing.current_price)}</strong>
-                  <StatusPill status={listing.inventory_status} count={listing.inventory_count} />
                   <button className="ghost-button" type="button" onClick={() => openDetail(listing)}>
-                    Manage
+                    Details
                   </button>
                 </div>
               </article>
@@ -480,128 +413,29 @@ export default function App() {
                   <span>Last updated</span>
                   <strong>{compactDate(selected.updated_at)}</strong>
                 </div>
+                <div>
+                  <span>Last seen</span>
+                  <strong>{compactDate(selected.last_seen_at)}</strong>
+                </div>
               </div>
 
+              <p className="listing-meta">
+                {selected.unit_price_text || selected.current_price_text || "No unit pricing available"}
+              </p>
               <TrendBars history={history} />
-
-              <form className="stack-form" onSubmit={submitInventoryAdjustment}>
-                <h3>Inventory adjustment</h3>
-                <label>
-                  Delta
-                  <input
-                    type="number"
-                    value={inventoryForm.delta}
-                    onChange={(event) =>
-                      setInventoryForm((current) => ({ ...current, delta: event.target.value }))
-                    }
-                  />
-                </label>
-                <label>
-                  Reason
-                  <select
-                    value={inventoryForm.reason}
-                    onChange={(event) =>
-                      setInventoryForm((current) => ({ ...current, reason: event.target.value }))
-                    }
-                  >
-                    <option value="restock">restock</option>
-                    <option value="cycle_count">cycle_count</option>
-                    <option value="shrink">shrink</option>
-                    <option value="manual_fix">manual_fix</option>
-                  </select>
-                </label>
-                <label>
-                  Actor
-                  <input
-                    value={inventoryForm.actor}
-                    onChange={(event) =>
-                      setInventoryForm((current) => ({ ...current, actor: event.target.value }))
-                    }
-                    placeholder="stock_manager"
-                  />
-                </label>
-                <button className="primary-button" type="submit">
-                  Update Inventory
-                </button>
-              </form>
-
-              <form className="stack-form" onSubmit={submitPurchase}>
-                <h3>Purchase transaction</h3>
-                <label>
-                  Quantity
-                  <input
-                    type="number"
-                    min="1"
-                    value={purchaseForm.quantity}
-                    onChange={(event) =>
-                      setPurchaseForm((current) => ({ ...current, quantity: event.target.value }))
-                    }
-                  />
-                </label>
-                <label>
-                  Purchaser
-                  <input
-                    value={purchaseForm.purchaserName}
-                    onChange={(event) =>
-                      setPurchaseForm((current) => ({
-                        ...current,
-                        purchaserName: event.target.value
-                      }))
-                    }
-                    placeholder="Jordan"
-                  />
-                </label>
-                <label>
-                  Note
-                  <textarea
-                    rows="3"
-                    value={purchaseForm.note}
-                    onChange={(event) =>
-                      setPurchaseForm((current) => ({ ...current, note: event.target.value }))
-                    }
-                    placeholder="Optional purchase note"
-                  />
-                </label>
-                <button className="accent-button" type="submit">
-                  Record Purchase
-                </button>
-              </form>
+              {selected.note ? <p className="listing-meta">{selected.note}</p> : null}
+              {selected.url ? (
+                <a className="accent-button" href={selected.url} target="_blank" rel="noreferrer">
+                  View Store Listing
+                </a>
+              ) : null}
             </>
           ) : (
             <div className="empty-state">
-              Pick a listing to inspect its price trend, adjust inventory, or create a purchase transaction.
+              Pick a listing to inspect its latest offer details and recent price trend.
             </div>
           )}
         </aside>
-
-        <section className="panel panel-wide reveal">
-          <div className="panel-header">
-            <div>
-              <p className="eyebrow">Ledger</p>
-              <h2>Recent purchase transactions</h2>
-            </div>
-          </div>
-
-          <div className="transaction-list">
-            {transactions.map((transaction) => (
-              <article key={transaction.id} className="transaction-card">
-                <div>
-                  <strong>{transaction.item.title}</strong>
-                  <p>{transaction.item.store.name}</p>
-                </div>
-                <div>
-                  <span>{transaction.quantity} units</span>
-                  <strong>{currency(transaction.total_price)}</strong>
-                </div>
-                <small>{compactDate(transaction.created_at)}</small>
-              </article>
-            ))}
-
-            {transactions.length === 0 ? (
-              <div className="empty-state">No transactions recorded yet.</div>
-            ) : null}
-          </div>
-        </section>
       </main>
     </div>
   );

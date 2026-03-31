@@ -35,6 +35,8 @@ class PlatformApiTests(unittest.TestCase):
     def setUp(self) -> None:
         Base.metadata.drop_all(self.engine)
         Base.metadata.create_all(self.engine)
+        self.app.extensions["collector_refresh_statuses"] = {}
+        self.app.extensions["collector_inflight_refreshes"] = set()
         session = self.session_factory()
         try:
             seed_demo_data(session)
@@ -52,14 +54,41 @@ class PlatformApiTests(unittest.TestCase):
         finally:
             session.close()
 
+    def set_refresh_status(
+        self,
+        refresh_key: str,
+        *,
+        state: str = "running",
+        stores: list[str] | None = None,
+        error: str | None = None,
+    ) -> None:
+        now = utcnow()
+        self.app.extensions["collector_refresh_statuses"][refresh_key] = {
+            "key": refresh_key,
+            "query": "apple",
+            "stores": tuple(stores or ["target"]),
+            "limit": 30,
+            "state": state,
+            "error": error,
+            "created_at": now,
+            "started_at": now,
+            "finished_at": now if state in {"completed", "failed"} else None,
+            "updated_at": now,
+        }
+
     def test_products_endpoint_returns_seeded_items(self) -> None:
         response = self.client.get("/api/products?query=apple")
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertGreaterEqual(payload["count"], 3)
+        self.assertNotIn("inventory_count", payload["items"][0])
+        self.assertNotIn("inventory_status", payload["items"][0])
 
     def test_products_endpoint_skips_refresh_when_cached_data_is_fresh(self) -> None:
-        with patch("grocery_platform.services.collector.collect_prices") as mock_collect:
+        with (
+            patch("grocery_platform.services.collector.collect_prices") as mock_collect,
+            patch("grocery_platform.services.collector.schedule_query_refresh") as mock_schedule,
+        ):
             response = self.client.get(
                 "/api/products?query=apple&store=target&refresh_if_stale=true"
             )
@@ -67,23 +96,31 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertFalse(payload["refreshed"])
+        self.assertEqual(payload["refresh_mode"], "none")
         self.assertEqual(payload["refreshed_stores"], [])
         mock_collect.assert_not_called()
+        mock_schedule.assert_not_called()
 
-    def test_products_endpoint_refreshes_stale_store_when_requested(self) -> None:
+    def test_products_endpoint_schedules_background_refresh_for_stale_store(self) -> None:
         self.age_listing(1, hours=25)
 
-        with patch("grocery_platform.services.collector.collect_prices") as mock_collect:
-            mock_collect.return_value = [
-                ProductPrice(
-                    store="target",
-                    keyword="apple",
-                    title="Fresh Honeycrisp Apple - each",
-                    price_text="$1.29",
-                    price=1.29,
-                    url="https://example.com/fresh-honeycrisp-apple",
-                )
-            ]
+        with (
+            patch("grocery_platform.services.collector.schedule_query_refresh") as mock_schedule,
+            patch("grocery_platform.services.collector.get_refresh_status") as mock_status,
+        ):
+            mock_schedule.return_value = ["target"]
+            mock_status.return_value = {
+                "key": "apple::target::25",
+                "query": "apple",
+                "stores": ["target"],
+                "limit": 25,
+                "state": "queued",
+                "error": None,
+                "created_at": utcnow().isoformat(),
+                "started_at": None,
+                "finished_at": None,
+                "updated_at": utcnow().isoformat(),
+            }
             response = self.client.get(
                 "/api/products?query=apple&store=target&refresh_if_stale=true"
             )
@@ -91,39 +128,92 @@ class PlatformApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertTrue(payload["refreshed"])
+        self.assertEqual(payload["refresh_mode"], "background")
         self.assertEqual(payload["refreshed_stores"], ["target"])
         self.assertIsNone(payload["refresh_error"])
+        self.assertEqual(payload["refresh_status"]["state"], "queued")
+        self.assertEqual(payload["refresh_status"]["stores"], ["target"])
+        self.assertGreaterEqual(payload["count"], 1)
+        mock_schedule.assert_called_once()
+
+    def test_products_endpoint_reads_through_on_cache_miss(self) -> None:
+        with patch("grocery_platform.services.collector.collect_prices") as mock_collect:
+            mock_collect.return_value = [
+                ProductPrice(
+                    store="target",
+                    keyword="dragon fruit",
+                    title="Dragon Fruit - each",
+                    price_text="$3.49",
+                    price=3.49,
+                    url="https://example.com/dragon-fruit",
+                )
+            ]
+            response = self.client.get("/api/products?query=dragon%20fruit")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["refreshed"])
+        self.assertEqual(payload["refresh_mode"], "blocking")
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["items"][0]["title"], "Dragon Fruit - each")
         mock_collect.assert_called_once()
-        self.assertEqual(payload["items"][0]["current_price"], 1.29)
 
-    def test_inventory_adjustment_updates_quantity(self) -> None:
-        response = self.client.post(
-            "/api/inventory/adjustments",
-            json={
-                "listing_id": 1,
-                "delta": 2,
-                "reason": "restock",
-                "actor": "test_runner",
-            },
-        )
-        self.assertEqual(response.status_code, 201)
-        payload = response.get_json()
-        self.assertEqual(payload["item"]["inventory_count"], 28)
+    def test_products_endpoint_force_refresh_schedules_background_refresh(self) -> None:
+        with (
+            patch("grocery_platform.services.collector.schedule_query_refresh") as mock_schedule,
+            patch("grocery_platform.services.collector.get_refresh_status") as mock_status,
+        ):
+            mock_schedule.return_value = ["target"]
+            mock_status.return_value = {
+                "key": "apple::target::25",
+                "query": "apple",
+                "stores": ["target"],
+                "limit": 25,
+                "state": "running",
+                "error": None,
+                "created_at": utcnow().isoformat(),
+                "started_at": utcnow().isoformat(),
+                "finished_at": None,
+                "updated_at": utcnow().isoformat(),
+            }
+            response = self.client.get("/api/products?query=apple&store=target&refresh=true")
 
-    def test_purchase_transaction_decrements_inventory(self) -> None:
-        response = self.client.post(
-            "/api/transactions/purchases",
-            json={
-                "listing_id": 1,
-                "quantity": 2,
-                "purchaser_name": "test_runner",
-                "note": "smoke transaction",
-            },
-        )
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 200)
         payload = response.get_json()
-        self.assertEqual(payload["transaction"]["quantity"], 2)
-        self.assertEqual(payload["item"]["inventory_count"], 24)
+        self.assertTrue(payload["refreshed"])
+        self.assertEqual(payload["refresh_mode"], "background")
+        self.assertEqual(payload["refreshed_stores"], ["target"])
+        self.assertEqual(payload["refresh_status"]["state"], "running")
+        mock_schedule.assert_called_once()
+
+    def test_refresh_status_endpoint_returns_tracked_job(self) -> None:
+        self.set_refresh_status("apple::target::25", state="running")
+
+        response = self.client.get("/api/refresh-status?key=apple%3A%3Atarget%3A%3A25")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["key"], "apple::target::25")
+        self.assertEqual(payload["state"], "running")
+        self.assertEqual(payload["stores"], ["target"])
+
+    def test_product_detail_returns_item_and_history_only(self) -> None:
+        response = self.client.get("/api/products/1")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertIn("item", payload)
+        self.assertIn("history", payload)
+        self.assertNotIn("transactions", payload)
+        self.assertNotIn("inventory_count", payload["item"])
+        self.assertNotIn("inventory_status", payload["item"])
+
+    def test_removed_inventory_transaction_and_manual_scrape_routes_return_404(self) -> None:
+        self.assertEqual(self.client.get("/api/inventory").status_code, 404)
+        self.assertEqual(self.client.post("/api/inventory/adjustments", json={}).status_code, 404)
+        self.assertEqual(self.client.get("/api/transactions").status_code, 404)
+        self.assertEqual(self.client.post("/api/transactions/purchases", json={}).status_code, 404)
+        self.assertEqual(self.client.post("/api/scrapes", json={"keyword": "apple"}).status_code, 404)
+        self.assertEqual(self.client.get("/api/products/1/history").status_code, 404)
 
 
 if __name__ == "__main__":
